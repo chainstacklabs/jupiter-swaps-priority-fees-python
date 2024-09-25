@@ -22,7 +22,7 @@ INPUT_MINT = "So11111111111111111111111111111111111111112"  # SOL
 OUTPUT_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
 AMOUNT = 1000000  # 0.001 SOL in lamports
 AUTO_MULTIPLIER = 1.1 # a 10% bump to the median of getRecentPrioritizationFees over last 150 blocks
-SLIPPAGE_BPS = 1000  # 1% slippage tolerance
+SLIPPAGE_BPS = 1000  # 10% slippage tolerance
 
 async def get_recent_blockhash(client: AsyncClient):
     response = await client.get_latest_blockhash()
