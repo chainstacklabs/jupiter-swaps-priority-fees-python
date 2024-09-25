@@ -10,12 +10,19 @@ from solders.transaction import VersionedTransaction
 from solders.compute_budget import set_compute_unit_price
 
 # Configuration
-PRIVATE_KEY = "YOUR_PRIVATE_KEY"
-RPC_ENDPOINT = "CHAINSTACK_ENDPOINT"
+PRIVATE_KEY = "PRIVATE_KEY"
+
+# trader node
+RPC_ENDPOINT = "CHAINSTACK_NODE"
+
+# regular node
+# RPC_ENDPOINT = "CHAINSTACK_NODE"
+
 INPUT_MINT = "So11111111111111111111111111111111111111112"  # SOL
 OUTPUT_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
 AMOUNT = 1000000  # 0.001 SOL in lamports
 AUTO_MULTIPLIER = 1.1 # a 10% bump to the median of getRecentPrioritizationFees over last 150 blocks
+SLIPPAGE_BPS = 1000  # 1% slippage tolerance
 
 async def get_recent_blockhash(client: AsyncClient):
     response = await client.get_latest_blockhash()
@@ -64,7 +71,7 @@ async def jupiter_swap(input_mint, output_mint, amount, auto_multiplier):
     print(f"Total amount (including prioritization fee): {total_amount}")
 
     print("Getting quote from Jupiter...")
-    quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={total_amount}"
+    quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={total_amount}&slippageBps={SLIPPAGE_BPS}"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(quote_url, timeout=10) as response:
