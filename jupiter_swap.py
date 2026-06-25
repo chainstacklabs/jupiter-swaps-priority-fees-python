@@ -7,7 +7,6 @@ import time
 from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
-from solders.compute_budget import set_compute_unit_price
 
 # Configuration
 PRIVATE_KEY = "PRIVATE_KEY"
@@ -18,21 +17,21 @@ RPC_ENDPOINT = "CHAINSTACK_NODE"
 # regular node
 # RPC_ENDPOINT = "CHAINSTACK_NODE"
 
+# Jupiter Swap API. lite-api.jup.ag is keyless (low rate); api.jup.ag takes an
+# X-API-Key header for higher tiers (get a key at https://portal.jup.ag).
+# The old quote-api.jup.ag/v6 endpoints were retired on 2025-10-01.
+JUPITER_API = "https://api.jup.ag/swap/v1"
+
 INPUT_MINT = "So11111111111111111111111111111111111111112"  # SOL
 OUTPUT_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
 AMOUNT = 1000000  # 0.001 SOL in lamports
-AUTO_MULTIPLIER = 1.1 # a 10% bump to the median of getRecentPrioritizationFees over last 150 blocks
+AUTO_MULTIPLIER = 1.1  # a 10% bump to the median of getRecentPrioritizationFees over last 150 blocks
 SLIPPAGE_BPS = 1000  # 10% slippage tolerance
 
-async def get_recent_blockhash(client: AsyncClient):
-    response = await client.get_latest_blockhash()
-    return response.value.blockhash, response.value.last_valid_block_height
 
-# Get the data on the priority fees over the last 150 blocks.
-# Note that it calculates the priority fees median from the returned data.
-# And if the majority of fees over the past 150 blocks are 0, you'll get a 0 here as well.
-# I found the median approach more reliable and peace of mind over something like getting some
-# fluke astronomical fee and using it. This can be easily drain your account.
+# Get the priority fee data over the last 150 blocks and return the median.
+# Note: if the majority of fees over the past 150 blocks are 0, you'll get a 0 here too.
+# The median is more reliable than chasing a fluke astronomical fee, which can drain your account.
 async def get_recent_prioritization_fees(client: AsyncClient, input_mint: str):
     body = {
         "jsonrpc": "2.0",
@@ -47,89 +46,76 @@ async def get_recent_prioritization_fees(client: AsyncClient, input_mint: str):
             print(f"Prioritization fee response: {json_response}")
             if json_response and "result" in json_response:
                 fees = [fee["prioritizationFee"] for fee in json_response["result"]]
-                return statistics.median(fees)
+                return statistics.median(fees) if fees else 0
     return 0
+
 
 async def jupiter_swap(input_mint, output_mint, amount, auto_multiplier):
     print("Initializing Jupiter swap...")
-    private_key = Keypair.from_bytes(base58.b58decode(PRIVATE_KEY))
-    WALLET_ADDRESS = private_key.pubkey()
-    print(f"Wallet address: {WALLET_ADDRESS}")
+    keypair = Keypair.from_bytes(base58.b58decode(PRIVATE_KEY))
+    wallet_address = keypair.pubkey()
+    print(f"Wallet address: {wallet_address}")
 
+    # Estimate the priority fee (in micro-lamports per compute unit) from recent blocks.
     async with AsyncClient(RPC_ENDPOINT) as client:
-        print("Getting recent blockhash...")
-        recent_blockhash, last_valid_block_height = await get_recent_blockhash(client)
-        print(f"Recent blockhash: {recent_blockhash}")
-        print(f"Last valid block height: {last_valid_block_height}")
-
         print("Getting recent prioritization fees...")
-        prioritization_fee = await get_recent_prioritization_fees(client, input_mint)
-        prioritization_fee *= auto_multiplier
-        print(f"Prioritization fee: {prioritization_fee}")
+        median_fee = await get_recent_prioritization_fees(client, input_mint)
+        compute_unit_price = int(median_fee * auto_multiplier)
+        print(f"Median priority fee: {median_fee} micro-lamports/CU -> using {compute_unit_price}")
 
-    total_amount = int(amount + prioritization_fee)
-    print(f"Total amount (including prioritization fee): {total_amount}")
-
+    # Get a quote from Jupiter for the swap amount (the priority fee is applied separately, below).
     print("Getting quote from Jupiter...")
-    quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={total_amount}&slippageBps={SLIPPAGE_BPS}"
+    quote_url = (
+        f"{JUPITER_API}/quote?inputMint={input_mint}&outputMint={output_mint}"
+        f"&amount={amount}&slippageBps={SLIPPAGE_BPS}"
+    )
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(quote_url, timeout=10) as response:
                 response.raise_for_status()
                 quote_response = await response.json()
-                print(f"Quote response: {quote_response}")
+                print(f"Quote: {amount} -> {quote_response['outAmount']} (out)")
     except aiohttp.ClientError as e:
         print(f"Error getting quote from Jupiter: {e}")
         return None
 
-    print("Getting swap data from Jupiter...")
-    swap_url = "https://quote-api.jup.ag/v6/swap"
+    # Build the swap transaction. Jupiter adds the compute-budget instructions for us:
+    # computeUnitPriceMicroLamports applies our priority fee, and dynamicComputeUnitLimit
+    # simulates the swap to set an accurate compute-unit limit.
+    print("Getting swap transaction from Jupiter...")
+    swap_url = f"{JUPITER_API}/swap"
     swap_data = {
         "quoteResponse": quote_response,
-        "userPublicKey": str(WALLET_ADDRESS),
-        "wrapUnwrapSOL": True
+        "userPublicKey": str(wallet_address),
+        "wrapAndUnwrapSol": True,
+        "computeUnitPriceMicroLamports": compute_unit_price,
+        "dynamicComputeUnitLimit": True,
     }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(swap_url, json=swap_data, timeout=10) as response:
                 response.raise_for_status()
                 swap_response = await response.json()
-                print(f"Swap response: {swap_response}")
+                print(f"Priority fee applied (lamports): {swap_response.get('prioritizationFeeLamports')}")
     except aiohttp.ClientError as e:
         print(f"Error getting swap data from Jupiter: {e}")
         return None
 
-    print("Creating and signing transaction...")
+    # Sign the returned versioned transaction and send it through your node.
+    print("Signing and sending transaction...")
     async with AsyncClient(RPC_ENDPOINT) as client:
         try:
-            swap_transaction = swap_response['swapTransaction']
-            print(f"Swap transaction length: {len(swap_transaction)}")
-            print(f"Swap transaction type: {type(swap_transaction)}")
-            
-            transaction_bytes = base64.b64decode(swap_transaction)
-            print(f"Decoded transaction length: {len(transaction_bytes)}")
-            
+            transaction_bytes = base64.b64decode(swap_response["swapTransaction"])
             unsigned_tx = VersionedTransaction.from_bytes(transaction_bytes)
-            print(f"Deserialized transaction: {unsigned_tx}")
+            signed_tx = VersionedTransaction(unsigned_tx.message, [keypair])
 
-            # Add ComputeBudget instruction to do the prioritization fee as implemented in solders
-            compute_budget_ix = set_compute_unit_price(int(prioritization_fee))
-            unsigned_tx.message.instructions.insert(0, compute_budget_ix)
-            
-            signed_tx = VersionedTransaction(unsigned_tx.message, [private_key])
-            
-            print(f"Final transaction to be sent: {signed_tx}")
-            
-            print("Sending transaction...")
             result = await client.send_transaction(signed_tx)
             print("Transaction sent.")
-            tx_signature = result.value
-            tx_details = await client.get_transaction(tx_signature)
-            print(f"Confirmed transaction details: {tx_details}")
             return result
         except Exception as e:
             print(f"Error creating or sending transaction: {str(e)}")
             return None
+
 
 async def wait_for_confirmation(client, signature, max_timeout=60):
     start_time = time.time()
@@ -142,6 +128,7 @@ async def wait_for_confirmation(client, signature, max_timeout=60):
             print(f"Error checking transaction status: {e}")
         await asyncio.sleep(1)
     return None
+
 
 async def main():
     try:
@@ -163,6 +150,7 @@ async def main():
                 print(f"Transaction confirmation status: {confirmation_status}")
     except Exception as e:
         print(f"An error occurred: {str(e)}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
